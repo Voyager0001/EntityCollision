@@ -7,6 +7,7 @@
 #include "MassProcessor.h"
 #include "MassSignalProcessorBase.h"
 
+#include "Avoidance/MassAvoidanceFragments.h"
 #include "CollisionProcessors.generated.h"
 
 
@@ -52,4 +53,7 @@ class ENTITYCOLLISION_API UCollisionProcessor : public UMassProcessor
  FVector ResolveCollisions(const TArray<FMassEntityHandle>& Entities, FMassEntityManager& EntityManager, float Radius,
                            FTransform
                            & EntityTransform);
+ FVector ResolveEdgeCollisions(const FMassNavigationEdgesFragment& NavEdges,
+	 float Radius,
+	 FTransform& EntityTransform);
 };
