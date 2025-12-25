@@ -100,6 +100,8 @@ void UCollisionProcessor::ConfigureQueries(const TSharedRef<FMassEntityManager>&
 	CollisionQuery.AddRequirement<FMassVelocityFragment>(EMassFragmentAccess::ReadWrite);
 	CollisionQuery.AddRequirement<FCollisionFragment>(EMassFragmentAccess::None); // used for filtering entities
 	CollisionQuery.AddTagRequirement<FMassOffLODTag>(EMassFragmentPresence::None);
+
+	CollisionQuery.AddRequirement<FMassNavigationEdgesFragment>(EMassFragmentAccess::ReadOnly);
 }
 
 void UCollisionProcessor::Execute(FMassEntityManager& EntityManager, FMassExecutionContext& Context)
@@ -129,38 +131,50 @@ void UCollisionProcessor::Execute(FMassEntityManager& EntityManager, FMassExecut
 
 	// If we are in range of an entity, push out of it
 	CollisionQuery.ParallelForEachEntityChunk(Context, [this, &EntityManager](FMassExecutionContext& Context)
-	{
-		const auto& HashGridSubsystem = Context.GetSubsystemChecked<UCollisionSubsystem>();
-		
-		const auto TransformFragments = Context.GetMutableFragmentView<FTransformFragment>();
-		const auto RadiusFragments = Context.GetFragmentView<FAgentRadiusFragment>();
-		const auto VelocityFragments = Context.GetMutableFragmentView<FMassVelocityFragment>();
-		
-		const int32 NumEntities = Context.GetNumEntities();
-		for (int EntityIdx = 0; EntityIdx < NumEntities; EntityIdx++)
 		{
-			auto& TransformFragment = TransformFragments[EntityIdx];
-			const auto& RadiusFragment = RadiusFragments[EntityIdx];
-			auto& Velocity = VelocityFragments[EntityIdx];
-			
-			const auto Radius = RadiusFragment.Radius;
-			auto& Transform = TransformFragment.GetMutableTransform();
-			
-			FBox Bounds = { Transform.GetLocation() - HalfRange/2, Transform.GetLocation() + HalfRange/2 };
-			
-			TArray<FMassEntityHandle> Entities;
-			HashGridSubsystem.HashGridData.QuerySmall(Bounds, Entities);
+			const auto& HashGridSubsystem = Context.GetSubsystemChecked<UCollisionSubsystem>();
 
-			// Ignore ourselves
-			Entities = Entities.FilterByPredicate([&Context, EntityIdx](const FMassEntityHandle& OtherEntity)
+			const auto TransformFragments = Context.GetMutableFragmentView<FTransformFragment>();
+			const auto RadiusFragments = Context.GetFragmentView<FAgentRadiusFragment>();
+			const auto VelocityFragments = Context.GetMutableFragmentView<FMassVelocityFragment>();
+
+			const auto NavigationEdgesFragments = Context.GetFragmentView<FMassNavigationEdgesFragment>(); // Get edges
+
+			const int32 NumEntities = Context.GetNumEntities();
+			for (int EntityIdx = 0; EntityIdx < NumEntities; EntityIdx++)
 			{
-				return OtherEntity != Context.GetEntity(EntityIdx);
-			});
-			
-			FVector HitNormal = ResolveCollisions(Entities, EntityManager, Radius, Transform);
-			Velocity.Value = FVector::VectorPlaneProject(Velocity.Value, HitNormal);
-		}
-	});
+				auto& TransformFragment = TransformFragments[EntityIdx];
+				const auto& RadiusFragment = RadiusFragments[EntityIdx];
+				auto& Velocity = VelocityFragments[EntityIdx];
+
+				const auto& NavEdges = NavigationEdgesFragments[EntityIdx]; // Current entity's edges
+
+				const auto Radius = RadiusFragment.Radius;
+				auto& Transform = TransformFragment.GetMutableTransform();
+
+				FBox Bounds = { Transform.GetLocation() - HalfRange / 2, Transform.GetLocation() + HalfRange / 2 };
+
+				TArray<FMassEntityHandle> Entities;
+				HashGridSubsystem.HashGridData.QuerySmall(Bounds, Entities);
+
+				// Ignore ourselves
+				Entities = Entities.FilterByPredicate([&Context, EntityIdx](const FMassEntityHandle& OtherEntity)
+					{
+						return OtherEntity != Context.GetEntity(EntityIdx);
+					});
+
+				FVector AgentHitNormal = ResolveCollisions(Entities, EntityManager, Radius, Transform);
+				// 2. Resolve Agent-to-Edge (Navmesh Boundaries)
+				FVector EdgeHitNormal = ResolveEdgeCollisions(NavEdges, Radius, Transform);
+
+				// Combine normals and project velocity
+				FVector TotalNormal = (AgentHitNormal + EdgeHitNormal).GetSafeNormal();
+				if (!TotalNormal.IsNearlyZero())
+				{
+					Velocity.Value = FVector::VectorPlaneProject(Velocity.Value, TotalNormal);
+				}
+			}
+		});
 }
 
 FVector UCollisionProcessor::ResolveCollisions(const TArray<FMassEntityHandle>& Entities,
@@ -190,4 +204,46 @@ FVector UCollisionProcessor::ResolveCollisions(const TArray<FMassEntityHandle>& 
 	}
 	
 	return HitNormal;
+}
+
+FVector UCollisionProcessor::ResolveEdgeCollisions(const FMassNavigationEdgesFragment& NavEdges,
+	float Radius,
+	FTransform& EntityTransform)
+{
+	FVector CombinedNormal(0.f);
+	FVector EntityLocation = EntityTransform.GetLocation();
+
+	for (const FNavigationAvoidanceEdge& Edge : NavEdges.AvoidanceEdges)
+	{
+		// Project entity location onto the line segment (Edge.Start to Edge.End)
+		// FMath::ClosestPointOnSegment is the standard way to do this in UE
+		FVector ClosestPoint = FMath::ClosestPointOnSegment(EntityLocation, Edge.Start, Edge.End);
+
+		float DistSq = FVector::DistSquared(EntityLocation, ClosestPoint);
+
+		if (DistSq < FMath::Square(Radius))
+		{
+			float Distance = FMath::Sqrt(DistSq);
+			FVector PushDirection;
+
+			if (Distance > 0.001f)
+			{
+				PushDirection = (EntityLocation - ClosestPoint) / Distance;
+			}
+			else
+			{
+				// If exactly on the edge, use the pre-calculated LeftDir from the fragment
+				PushDirection = Edge.LeftDir;
+			}
+
+			float Depth = Radius - Distance;
+
+			// Push the entity out
+			EntityLocation += PushDirection * Depth;
+			EntityTransform.SetLocation(EntityLocation);
+
+			CombinedNormal += PushDirection;
+		}
+	}
+	return CombinedNormal.GetSafeNormal();
 }
